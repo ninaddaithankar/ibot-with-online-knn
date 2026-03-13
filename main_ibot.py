@@ -25,9 +25,46 @@ from PIL import Image
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 from tensorboardX import SummaryWriter
+import wandb
 from models.head import iBOTHead
 from loader import ImageFolderMask
+from loader_ssv2 import SomethingDatasetMask
 from evaluation.unsupervised.unsup_cls import eval_pred
+
+
+def ssv2_collate_fn(batch):
+    """
+    Collate for SomethingDatasetMask (per-video mode).
+
+    Each item is (frames, label, masks) where:
+      frames[j]: [num_frames, C, H, W]
+      masks[j]:  [num_frames, H_grid, W_grid]  (numpy)
+
+    Flattens num_frames into the batch dimension so the training loop sees
+    the same format as ImageFolderMask:
+      images[j]: [B * num_frames, C, H, W]
+      labels:    [B * num_frames]
+      masks[j]:  [B * num_frames, H_grid, W_grid]
+    """
+    num_views = len(batch[0][0])
+    T = batch[0][0][0].shape[0]  # num_frames
+
+    images = []
+    for j in range(num_views):
+        stacked = torch.stack([item[0][j] for item in batch])  # [B, T, C, H, W]
+        B = stacked.shape[0]
+        images.append(stacked.view(B * T, *stacked.shape[2:]))
+
+    labels = torch.tensor([item[1] for item in batch])         # [B]
+    labels = labels.unsqueeze(1).expand(-1, T).reshape(-1)     # [B * T]
+
+    masks = []
+    for j in range(num_views):
+        stacked = torch.stack([torch.from_numpy(item[2][j]) for item in batch])  # [B, T, Hg, Wg]
+        B = stacked.shape[0]
+        masks.append(stacked.view(B * T, *stacked.shape[2:]))
+
+    return images, labels, masks
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -138,6 +175,22 @@ def get_args_parser():
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
 
+    # Dataset selection
+    parser.add_argument('--dataset', default='imagenet', type=str, choices=['imagenet', 'ssv2'],
+        help='Dataset to use for pre-training. (Default: imagenet)')
+
+    # SSv2-specific args (only used when --dataset ssv2)
+    parser.add_argument('--ssv2_dir', default='/path/to/ssv2/', type=str,
+        help='Root SSv2 directory (must contain 20bn-something-something-v2/ and labels/).')
+    parser.add_argument('--ssv2_labels_dir', default='labels/', type=str,
+        help='Path to SSv2 labels directory, relative to --ssv2_dir or absolute. (Default: labels/)')
+    parser.add_argument('--ssv2_split', default='train', type=str, choices=['train', 'val'],
+        help='SSv2 split to use for pre-training. (Default: train)')
+    parser.add_argument('--ssv2_num_frames', default=16, type=int,
+        help='Number of frames to sample per video. Each frame is an independent sample. (Default: 16)')
+    parser.add_argument('--ssv2_time_between_frames', default=0.25, type=float,
+        help='Time in seconds between sampled frames within a clip. (Default: 0.25)')
+
     # Misc
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
@@ -148,6 +201,10 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+    # W&B logging
+    parser.add_argument('--wandb_project', default=None, type=str, help='W&B project name. Logging disabled if not set.')
+    parser.add_argument('--wandb_run_name', default=None, type=str, help='W&B run name (optional).')
+    parser.add_argument('--wandb_entity', default=None, type=str, help='W&B entity/team (optional).')
     return parser
 
 def train_ibot(args):
@@ -165,25 +222,44 @@ def train_ibot(args):
         args.local_crops_number,
     )
     pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
-    dataset = ImageFolderMask(
-        args.data_path, 
-        transform=transform,
+    mask_kwargs = dict(
         patch_size=pred_size,
         pred_ratio=args.pred_ratio,
         pred_ratio_var=args.pred_ratio_var,
         pred_aspect_ratio=(0.3, 1/0.3),
         pred_shape=args.pred_shape,
-        pred_start_epoch=args.pred_start_epoch)
+        pred_start_epoch=args.pred_start_epoch,
+    )
+    if args.dataset == 'ssv2':
+        dataset = SomethingDatasetMask(
+            dataset_dir=args.ssv2_dir,
+            split=args.ssv2_split,
+            transform=transform,
+            labels_dir=args.ssv2_labels_dir,
+            num_frames=args.ssv2_num_frames,
+            time_between_frames=args.ssv2_time_between_frames,
+            **mask_kwargs,
+        )
+        collate_fn = ssv2_collate_fn
+        print(f"Data loaded: SSv2 {args.ssv2_split} split — {len(dataset)} videos, {args.ssv2_num_frames} frames each.")
+    else:
+        dataset = ImageFolderMask(
+            args.data_path,
+            transform=transform,
+            **mask_kwargs,
+        )
+        collate_fn = None
+        print(f"Data loaded: there are {len(dataset)} images.")
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
+        collate_fn=collate_fn,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True
     )
-    print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -287,6 +363,13 @@ def train_ibot(args):
     if utils.is_main_process(): # Tensorboard configuration
         local_runs = os.path.join(args.output_dir, 'tf_logs')
         writer = SummaryWriter(logdir=local_runs)
+        if args.wandb_project:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                entity=args.wandb_entity,
+                config=vars(args),
+            )
         
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
@@ -365,10 +448,14 @@ def train_ibot(args):
                 f.write(json.dumps(log_stats) + "\n")
                 for k, v in train_stats.items():
                     writer.add_scalar(k, v, epoch)
+            if args.wandb_project:
+                wandb.log(log_stats)
         
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if utils.is_main_process() and args.wandb_project:
+        wandb.finish()
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loader,
