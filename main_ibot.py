@@ -30,6 +30,7 @@ from models.head import iBOTHead
 from loader import ImageFolderMask
 from loader_ssv2 import SomethingDatasetMask
 from evaluation.unsupervised.unsup_cls import eval_pred
+from eval_knn import evaluate_knn
 
 
 def ssv2_collate_fn(batch):
@@ -205,6 +206,15 @@ def get_args_parser():
     parser.add_argument('--wandb_project', default=None, type=str, help='W&B project name. Logging disabled if not set.')
     parser.add_argument('--wandb_run_name', default=None, type=str, help='W&B run name (optional).')
     parser.add_argument('--wandb_entity', default=None, type=str, help='W&B entity/team (optional).')
+    # Online KNN evaluation
+    parser.add_argument('--knn_freq', default=0, type=int,
+        help='Run KNN eval every N epochs. 0 disables KNN evaluation.')
+    parser.add_argument('--nb_knn', default=[10, 20], nargs='+', type=int,
+        help='Values of k for k-NN evaluation. (Default: 10 20)')
+    parser.add_argument('--knn_temperature', default=0.07, type=float,
+        help='Temperature for k-NN voting. (Default: 0.07)')
+    parser.add_argument('--knn_use_cuda', default=True, type=utils.bool_flag,
+        help='Store KNN features on GPU. Set False if OOM. (Default: True)')
     return parser
 
 def train_ibot(args):
@@ -443,6 +453,18 @@ def train_ibot(args):
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
+
+        # ============ online KNN evaluation ... ============
+        if args.knn_freq > 0 and (
+            (epoch + 1) % args.knn_freq == 0 or epoch == args.epochs - 1
+        ):
+            print(f"Running KNN evaluation after epoch {epoch + 1}...")
+            knn_stats = evaluate_knn(teacher_without_ddp.backbone, args)
+            log_stats.update({f'knn_{k}': v for k, v in knn_stats.items()})
+            if utils.is_main_process():
+                for k, v in knn_stats.items():
+                    writer.add_scalar(f'knn/{k}', v, epoch)
+
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
