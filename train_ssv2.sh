@@ -1,62 +1,74 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+
+#SBATCH --account=bdta-dtai-gh
+#SBATCH --partition=ghx4
+### NODE/CPU/MEM/GPU ###
+#SBATCH --mem-bind=verbose,local
+#SBATCH --mem-per-gpu=118G
+#SBATCH --cpus-per-gpu=72
+
+### ADDITIONAL RUN INFO ###
+#SBATCH --array=0
+#SBATCH --time=48:00:00
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=2
+
+### LOG INFO ###
+#SBATCH --job-name=VIT_SMALL|ibot_ssv2
+#SBATCH --output=logs/slurm/VIT_SMALL|ibot_ssv2/%A-%a.log
+export RUN_NAME="VIT_SMALL|ibot_ssv2"
 
 # ============================================================
 #  iBOT pre-training on Something-Something v2
-#  Usage: bash train_ssv2.sh
+#  Submit: sbatch train_ssv2.sh
 # ============================================================
 
+export MASTER_PORT=$((20000 + (${SLURM_ARRAY_JOB_ID:-0} % 9999) + ${SLURM_ARRAY_TASK_ID:-0}))
+
 # ---- Paths ----
-SSV2_DIR="/shared/nas2/ninadd2/datasets/ssv2"          # root dir containing 20bn-something-something-v2/ and labels/
-SSV2_LABELS_DIR="labels/"          # relative to SSV2_DIR, or set an absolute path
-OUTPUT_DIR="./work_dirs/ibot_ssv2"
+SSV2_DIR="/work/hdd/bcsi/ndaithankar/datasets/ssv2"
+SSV2_LABELS_DIR="labels/"
+OUTPUT_DIR="./work_dirs/${RUN_NAME}"
+
 # ---- W&B ----
 WANDB_PROJECT="ibot-ssv2"
-WANDB_RUN_NAME=""        # leave empty to let W&B auto-generate
-WANDB_ENTITY=""          # leave empty to use your default entity
+WANDB_RUN_NAME=""
+WANDB_ENTITY=""
 
 # ---- Hardware ----
-N_GPUS=2
-N_WORKERS=8   # data loader workers per GPU
+NUM_GPUS=2
+N_WORKERS=8
 
 # ---- Model ----
-ARCH="vit_base"
+ARCH="vit_small"
 PATCH_SIZE=16
 
 # ---- KNN evaluation ----
-KNN_FREQ=1           # run KNN every N epochs; set to 0 to disable
-NB_KNN="10 20"       # k values to evaluate
+KNN_FREQ=1
+NB_KNN="10 20"
 
 # ---- Training ----
 EPOCHS=100
-BATCH_SIZE_PER_GPU=8   # effective batch = N_GPUS * BATCH_SIZE_PER_GPU
+BATCH_SIZE_PER_GPU=8
 LR=0.0005
 PRED_RATIO=0.3
-PRED_SHAPE="block"      # block or rand
+PRED_SHAPE="block"
 NUM_FRAMES=16
 TIME_BETWEEN_FRAMES=0.25
 
 # ============================================================
 
-CURDIR=$(cd "$(dirname "$0")"; pwd)
 mkdir -p "$OUTPUT_DIR"
+mkdir -p "logs/slurm/${RUN_NAME}"
 
-echo "========================================"
-echo " iBOT SSv2 pre-training"
-echo "  GPUs            : $N_GPUS"
-echo "  Arch            : $ARCH (patch $PATCH_SIZE)"
-echo "  Epochs          : $EPOCHS"
-echo "  Batch/GPU       : $BATCH_SIZE_PER_GPU  (total: $((N_GPUS * BATCH_SIZE_PER_GPU)))"
-echo "  Frames/video    : $NUM_FRAMES  (dt: ${TIME_BETWEEN_FRAMES}s)"
-echo "  SSv2 dir        : $SSV2_DIR"
-echo "  Output dir      : $OUTPUT_DIR"
-echo "  W&B project     : ${WANDB_PROJECT:-disabled}"
-echo "  KNN eval freq   : ${KNN_FREQ} epochs  (k = $NB_KNN)"
-echo "========================================"
+module purge
+ulimit -n 65535
 
-CUDA_VISIBLE_DEVICES=2,3 torchrun \
-    --nproc_per_node="$N_GPUS" \
-    --master_port=29500 \
+CURDIR=$(cd "$(dirname "$0")"; pwd)
+
+torchrun \
+    --master_port ${MASTER_PORT} \
+    --nproc_per_node=${NUM_GPUS} \
     "$CURDIR/main_ibot.py" \
     --dataset ssv2 \
     --ssv2_dir "$SSV2_DIR" \
@@ -79,5 +91,4 @@ CUDA_VISIBLE_DEVICES=2,3 torchrun \
     --nb_knn $NB_KNN \
     ${WANDB_PROJECT:+--wandb_project "$WANDB_PROJECT"} \
     ${WANDB_RUN_NAME:+--wandb_run_name "$WANDB_RUN_NAME"} \
-    ${WANDB_ENTITY:+--wandb_entity "$WANDB_ENTITY"} \
-    "$@"   # pass any extra args from the command line
+    ${WANDB_ENTITY:+--wandb_entity "$WANDB_ENTITY"}
