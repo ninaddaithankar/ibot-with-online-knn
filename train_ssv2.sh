@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --account=bdta-dtai-gh
-#SBATCH --partition=ghx4
+#SBATCH --account=YOUR_ACCOUNT
+#SBATCH --partition=YOUR_PARTITION
 ### NODE/CPU/MEM/GPU ###
 #SBATCH --mem-bind=verbose,local
 #SBATCH --mem-per-gpu=118G
@@ -26,7 +26,7 @@ export RUN_NAME="VIT_SMALL|ibot_ssv2"
 export MASTER_PORT=$((20000 + (${SLURM_ARRAY_JOB_ID:-0} % 9999) + ${SLURM_ARRAY_TASK_ID:-0}))
 
 # ---- Paths ----
-SSV2_DIR="/work/hdd/bcsi/ndaithankar/datasets/ssv2"
+SSV2_DIR="/path/to/ssv2"  # set to your SSv2 dataset root
 SSV2_LABELS_DIR="labels/"
 OUTPUT_DIR="./work_dirs/${RUN_NAME}"
 
